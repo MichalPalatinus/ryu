@@ -35,7 +35,11 @@ import pprint
 import time
 import urlparse
 import datetime
-
+import os
+import subprocess
+#import thread
+#import sched
+from ryu.lib import ofctl_v1_3
 ###Global variable initialization
 
 ##logger
@@ -87,7 +91,7 @@ for i in range(100,199):
 
 ##List of APNs in network
 APN_POOL=[]
-
+FREE_INTERFACES = {"14_3":"apn1", "13_4":"apn2"}
 ##List of BSSs in network
 #XXX:for now it's static
 BSS_POOL=['901-70-1-0']
@@ -105,7 +109,107 @@ INACTIVE_TUNNELS=[]
 ##List of used Tunnel identifiers
 TID_POOL = []
 
+##List of forwarders in topology
+FORWARDERS = []
 
+##FLOW TYPES VALUES
+APN_SPECIAL=1
+TOPOLOGY_DISCOVERY=2
+ACCESS_EDGE_ADITIONAL=3
+TUNNEL_RULES=4
+PDP_FLOWS=5
+USER_DEFINED=6
+
+##ARRAY FOR PORTS STATISTICS
+FWD_PSTATS = {}
+FWD_FSTATS = {}
+PREPINACE = []
+
+class Stats:
+    def __init__(self, port_no, rx_packets, tx_packets, rx_bytes, tx_bytes, rx_dropped, tx_dropped, rx_errors, tx_errors, rx_frame_err, rx_over_err, rx_crc_err, collisions, duration_sec, duration_nsec):
+        self.port_no = port_no
+        self.rx_packets = rx_packets
+        self.tx_packets = tx_packets
+        self.rx_bytes = rx_bytes
+        self.tx_bytes = tx_bytes
+        self.rx_dropped = rx_dropped
+        self.tx_dropped = tx_dropped
+        self.rx_errors = rx_errors
+        self.tx_errors = tx_errors
+        self.rx_frame_err = rx_frame_err
+        self.rx_over_err = rx_over_err
+        self.rx_crc_err = rx_crc_err
+        self.collisions = collisions
+        self.duration_sec = duration_sec
+        self.duration_nsec = duration_nsec
+
+class flowStats:
+    def __init__(self, table_id, duration_sec, duration_nsec, priority, idle_timeout, hard_timeout, flags, cookie, packet_count, byte_count, match, instructions):
+        self.table_id=table_id
+        self.duration_sec = duration_sec
+        self.duration_nsec = duration_nsec
+        self.priority = priority
+        self.idle_timeout = idle_timeout
+        self.hadr_timeout = hard_timeout
+        self.flags = str(flags)
+        self.cookie = cookie
+        self.packet_count = packet_count
+        self.byte_count = byte_count
+        self.match = match._fields2
+        #self.instructions = instructions
+
+class prepinac:
+    def __init__(self, p, m, instruct, prep):
+        self.p=p
+        self.m=m
+        self.instruct=instruct
+        self.prep=prep
+
+class flow:
+    def __init__(self, priority, match, inst, flow_type, cookie):
+        #LOG.debug("MICHAL: Initializing a new flow")
+        self.priority = priority
+        self.match = match 
+        self.inst = inst
+        self.flow_type = flow_type
+        self.cookie = cookie
+
+
+class table:
+
+    def __init__(self, table_id):
+        #LOG.debug("MICHAL: Initializing a new table.")
+        self.id = table_id
+        self.flows = []   
+
+    def add_flow(self, priority, match, inst, flow_type, cookie):
+        LOG.debug("MICHAL: Adding flow to table.")
+        self.flows.append(flow(priority, match, inst, flow_type, cookie))
+
+
+class forwarder:
+    def __init__(self, datapath):
+        self.id = datapath.id
+        self.tables = []
+ 
+    def add_flow(self, table_id, priority, match, inst, flow_type, cookie):
+        if any(t.id == table_id for t in self.tables):
+            for t in self.tables:
+                if t.id == table_id:
+                    t.flows.append(flow(priority, match, inst, flow_type, cookie))
+        else:
+            self.tables.append(table(table_id))
+            for t in self.tables:
+                if t.id == table_id:
+                    t.flows.append(flow(priority, match, inst, flow_type, cookie))
+
+
+
+class Contexts:
+    def __init__(self, context_array= None):
+        self.context_array = context_array
+
+cont = Contexts()
 
 ###Topology and topology-related classes
 
@@ -160,15 +264,21 @@ class apn:
         self.ip_addr = ip_addr
         self.eth_addr = eth_addr
 
-
 ##XXX:maybe should be created from config file (Yang?)
 APN_POOL.append(apn('internet'))
+#APN_POOL.append(apn('mms'))
+
 
 
 class topology():
     """ 
     Topology class maintains graph of links between all nodes in network
     """
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {
+        'dpset': dpset.DPSet
+    }
+
     def __init__(self):
         self.StaticGraph=nx.DiGraph()
         self.DynamicGraph=nx.DiGraph()
@@ -219,9 +329,10 @@ class topology():
         #self.add_link(0xc,'internet',3)
         self.reload_topology()
 
+        
     def dump(self):
-	data = json_graph.node_link_data(self.DynamicGraph)
-	return json.dumps(data)
+        data = json_graph.node_link_data(self.DynamicGraph)
+        return json.dumps(data)
 
     def add_forwarder(self, fwID):
         self.StaticGraph.add_node(fwID)
@@ -258,7 +369,15 @@ class topology():
      
 ##Topology initialization
 topo = topology()
-
+f = open('/root/ryu/ryu/app/OF_actions.txt', 'r')
+actions_dictionary=f.read().replace('\n', ',')
+f.close()
+f = open('/root/ryu/ryu/app/OF_instructions.txt', 'r')
+inst_dictionary=f.read().replace('\n', ',')
+f.close()
+f = open('/root/ryu/ryu/app/OF_match_fields.txt', 'r')
+matches_dictionary=f.read().replace('\n', ',')
+f.close()
 
 ## convert IMSI string into byte array
 def imsi_to_bytes(imsi_string):
@@ -352,7 +471,7 @@ def _icmp_send(dp, port_out, ip_src=DISCOVERY_IP_SRC, ip_dst=DISCOVERY_IP_DST,
         icmp_code -- ICMP code, default is 0 which is No Code
 
     """
-
+    LOG.debug("MICHAL: Sending ICMP packet")
     ofp = dp.ofproto
     parser = dp.ofproto_parser
     pkt = packet.Packet()
@@ -444,6 +563,15 @@ class PDPContext:
         self.drx_param = drx_param
 
 
+#class Get_stats(threading.Thread):
+        
+#        def run():
+#            LOG.debug('MICHAL: bezi nit')
+#            time.sleep(10)
+
+#thread1 = Get_stats
+#thread1.run()
+
 class GPRSControll(app_manager.RyuApp):
     """
     Main class of controller application
@@ -466,7 +594,8 @@ class GPRSControll(app_manager.RyuApp):
         self.data['dpset'] = dpset
         self.data['waiters'] = self.waiters
         mapper = wsgi.mapper
-
+        #thread.start_new_thread(self.collect_stats, [])
+        
         ##RestCall reffers to class that holds methods/functions (WTF python calls them),
         ##that can be called via REST interface
         wsgi.registory['RestCall'] = self.data
@@ -485,6 +614,11 @@ class GPRSControll(app_manager.RyuApp):
         uri = path + '/pdp/{cmd}'
         mapper.connect('stats',uri,
                        controller=RestCall, action='mod_pdp',
+                       conditions=dict(method=['GET', 'HEAD']))
+
+        uri = path + '/pdp_dump'
+        mapper.connect('statc', uri,
+                       controller=RestCall, action='dump_active_pdps',
                        conditions=dict(method=['GET']))
 
         uri = '/topology/dump'
@@ -492,11 +626,54 @@ class GPRSControll(app_manager.RyuApp):
                        controller=RestCall, action='dump_topology',
                        conditions=dict(method=['GET', 'HEAD']))
 
+        uri = '/oftables/dump/{opt}'
+        mapper.connect('stats', uri,
+                       controller=RestCall, action='dump_oftables', 
+                       conditions=dict(method=['GET', 'HEAD']))
+
+
         #Testing
         uri =  '/test/info'
         mapper.connect('stats', uri,
                         controller=RestCall, action='test_info',
                         conditions=dict(method=['GET']))      
+
+        uri = '/tunnels/active/dump'
+        mapper.connect('stats', uri,
+                       controller=RestCall, action='dump_active_tunnels',
+                       conditions=dict(method=['GET', 'HEAD']))
+
+
+        uri = '/add_flow/{opt}'
+        mapper.connect('stats',uri,
+                       controller=RestCall, action='user_added_flow',
+                       conditions=dict(method=['GET', 'HEAD']))
+
+        uri = '/delete_flow/{opt}'
+        mapper.connect('stats', uri,
+                       controller=RestCall, action='delete_flow',
+                       conditions=dict(method=['GET', 'HEAD']))
+
+
+        uri = '/dump_port_stats'
+        mapper.connect('stats', uri,
+                       controller=RestCall, action='dump_statistics',
+                       conditions=dict(method=['GET', 'HEAD']))
+
+        uri = '/dump_flow_stats'
+        mapper.connect('stats', uri,
+                       controller=RestCall, action='dump_flow_statistics',
+                       conditions=dict(method=['GET', 'HEAD']))
+                       
+        uri = '/add_apn/{opt}'
+        mapper.connect('stats', uri,
+                       controller=RestCall, action='add_apn',
+                       conditions=dict(method=['GET', 'HEAD']))
+                       
+        uri = '/send_icmp/{opt}'
+        mapper.connect('stats', uri,
+                       controller=RestCall, action='send_icmp_packet',
+                       conditions=dict(method=['GET', 'HEAD']))
 
         ## DNS ressolution of IP address of PDP CNTs if it's not already defined
         ## !!! MAKE SURE you have valid DNS entry available in /etc/hosts or DNS server !!!
@@ -509,7 +686,7 @@ class GPRSControll(app_manager.RyuApp):
                 except socket.gaierror:
                     LOG.warning('Error while resolving apn name "'+apn.name+'"' )
 
-   
+
     def on_edge_inet_dp_join(self, dp, port):
         """ Add special rules for forwader on edge (APN-side) of network
 
@@ -528,9 +705,7 @@ class GPRSControll(app_manager.RyuApp):
         actions = [ parser.OFPActionOutput(ofp.OFPP_CONTROLLER) ]
         inst = [ parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions) ]
         req = parser.OFPFlowMod(datapath=dp, priority=10, match=match, instructions=inst)
-        dp.send_msg(req)
-
-
+        self.update_flows(dp, req, 0, 10, match, inst, APN_SPECIAL, 0)
 
     def on_inner_dp_join(self, dp):
         """ Add new inner (BSS side) forwarder joined our network.
@@ -544,7 +719,7 @@ class GPRSControll(app_manager.RyuApp):
         """
         ofp = dp.ofproto
         parser = dp.ofproto_parser
-        
+        LOG.debug("MICHAL: ID of datapath = " + str(dp.id))
         #Deletion of already existing OF flows
         LOG.debug('TOPO MNGR: Deleting flow table configuration of newly added forwarder ID: ' + str(dp.id) )
         dp.send_msg(parser.OFPFlowMod(datapath=dp, command=ofp.OFPFC_DELETE))
@@ -562,14 +737,14 @@ class GPRSControll(app_manager.RyuApp):
         LOG.debug('TOPO MNGR: Installing ICMP topology discovery flows on forwarder: ' + str(dp.id))       
         match = parser.OFPMatch(eth_type=0x0800, ip_proto=1, icmpv4_type=8, icmpv4_code=0, ipv4_dst=DISCOVERY_IP_DST)
         actions = [ parser.OFPActionOutput(ofp.OFPP_CONTROLLER) ]
-        self.add_flow(dp, 100, match, actions)
+        self.add_flow(dp, 100, match, actions, TOPOLOGY_DISCOVERY, 0, 0)
          
         ##Controller uses ARP to resolve mac_addresses of APNs
-        ##All arp replies with target IP of DISCOVERY_ARP_IP are redirected to controller
+        ## FIXED: All ARPs replies are redirected to the controller regardless of the target IP
         LOG.debug('TOPO MNGR: Installing ARP APN discovery flows on forwarder: ' + str(dp.id))
-        match= parser.OFPMatch(eth_type=0x0806, arp_op=2, arp_tpa=DISCOVERY_ARP_IP)
+        match= parser.OFPMatch(eth_type=0x0806, arp_op=2)
         actions = [ parser.OFPActionOutput(ofp.OFPP_CONTROLLER)]
-        self.add_flow(dp, 100, match, actions)
+        self.add_flow(dp, 100, match, actions, TOPOLOGY_DISCOVERY, 0, 0)
 
  
 
@@ -582,7 +757,8 @@ class GPRSControll(app_manager.RyuApp):
             inst = [ parser.OFPInstructionGotoTable(OF_GPRS_TABLE) ]
             match = parser.OFPMatch(eth_type=0x0800,ip_proto=inet.IPPROTO_UDP, udp_dst=VGSN_PORT)
             req = parser.OFPFlowMod(datapath=dp, priority=200, match=match, instructions=inst)
-            dp.send_msg(req)
+            self.update_flows(dp, req, 0, 200, match, inst, ACCESS_EDGE_ADITIONAL, 0)  #nebola udana tabulka
+            #dp.send_msg(req)            
 
             ## VGSN_PHY and BSS_PHY ports are bridged -- DHCP, ARP, Abis & stuff
             ## XXX: what if vGSN is not on same forwarder as BSS
@@ -590,13 +766,14 @@ class GPRSControll(app_manager.RyuApp):
             inst = [ parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions) ]
             match = parser.OFPMatch(in_port=BSS_PHY_PORT)
             req = parser.OFPFlowMod(datapath=dp, priority=10, match=match, instructions=inst)
-            dp.send_msg(req)
+            self.update_flows(dp, req, 0, 10, match, inst, ACCESS_EDGE_ADITIONAL, 0)
+            #dp.send_msg(req)
             actions = [ parser.OFPActionOutput(BSS_PHY_PORT) ]
             inst = [ parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions) ]
             match = parser.OFPMatch(in_port=VGSN_PHY_PORT)
             req = parser.OFPFlowMod(datapath=dp, priority=10, match=match, instructions=inst)
-            dp.send_msg(req)
-
+            self.update_flows(dp, req, 0, 10, match, inst, ACCESS_EDGE_ADITIONAL, 0)
+            #dp.send_msg(req)
    
             #################
             ## OF_GPRS-TABLE (2)
@@ -608,7 +785,7 @@ class GPRSControll(app_manager.RyuApp):
             actions = [ ] 
             inst = [ parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions) ]
             req = parser.OFPFlowMod(datapath=dp, table_id=OF_GPRS_TABLE, priority=200, match=match, instructions=inst)
-            dp.send_msg(req)
+            self.update_flows(dp, req, OF_GPRS_TABLE, 200, match, inst, ACCESS_EDGE_ADITIONAL, 0)
             
             ## if packet is first segment of SNDCP packet with more than one segment, it's forwarded to controller
             ## when controller recieves such packet it sends ICMP fragmentation_needed to its sender and drops original
@@ -616,7 +793,7 @@ class GPRSControll(app_manager.RyuApp):
             actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER) ] 
             inst = [ parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions) ]
             req = parser.OFPFlowMod(datapath=dp, table_id=OF_GPRS_TABLE, priority=200, match=match, instructions=inst)
-            dp.send_msg(req)
+            self.update_flows(dp, req, OF_GPRS_TABLE, 200, match, inst, ACCESS_EDGE_ADITIONAL, 0)
     
             ##if it's SNDCP packet taht still wasnt matched (rules with higher priority are inserted on PDP CNT activation)
             ##we assume it's packet of unknown PDP CNT and we DROP it
@@ -624,7 +801,7 @@ class GPRSControll(app_manager.RyuApp):
             actions = [ ]
             inst = [ parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions) ]
             req = parser.OFPFlowMod(datapath=dp, table_id=OF_GPRS_TABLE, priority=1, match=match, instructions=inst)
-            dp.send_msg(req)
+            self.update_flows(dp, req, OF_GPRS_TABLE, 1, match, inst, ACCESS_EDGE_ADITIONAL, 0)
 
             ##Everything else is Signalzation and is forwarded either to BSS or vGSN
             # XXX: co ak bss a vgsn nie su spolu na jednom DPID?
@@ -632,12 +809,13 @@ class GPRSControll(app_manager.RyuApp):
             inst = [ parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions) ]
             match = parser.OFPMatch(in_port=BSS_PHY_PORT)
             req = parser.OFPFlowMod(datapath=dp, table_id=OF_GPRS_TABLE, priority=0, match=match, instructions=inst)
-            dp.send_msg(req)
+            self.update_flows(dp, req, OF_GPRS_TABLE, 0, match, inst, ACCESS_EDGE_ADITIONAL, 0)
+
             actions = [ parser.OFPActionOutput(BSS_PHY_PORT) ]
             inst = [ parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions) ]
             match = parser.OFPMatch(in_port=VGSN_PHY_PORT)
             req = parser.OFPFlowMod(datapath=dp, table_id=OF_GPRS_TABLE, priority=0, match=match, instructions=inst)
-            dp.send_msg(req)
+            self.update_flows(dp, req, OF_GPRS_TABLE, 0, match, inst, ACCESS_EDGE_ADITIONAL, 0)
 
     def stats_reply_handler(self, ev):
         """
@@ -652,7 +830,6 @@ class GPRSControll(app_manager.RyuApp):
             return
         lock, msgs = self.waiters[dp.id][msg.xid]
         msgs.append(msg)
-
         flags = 0
         if dp.ofproto.OFP_VERSION == ofproto_v1_3.OFP_VERSION:
             flags = dp.ofproto.OFPMPF_REPLY_MORE
@@ -684,22 +861,14 @@ class GPRSControll(app_manager.RyuApp):
 
         ##ARP request recieved - send 'I'm here' response
         if match['eth_type'] == 0x0806 and match['arp_op'] == 1:
-            LOG.debug("PKT HND: ARP REQ HND: ARP request recieved")
-            if match['arp_spa'] == match['arp_tpa'] and match['eth_dst'] == 'ff:ff:ff:ff:ff:ff':
-                LOG.debug('PKT HND: ARP REQ HND:  This is a gratious ARP, we are not going to respond')
-            else:
-                prefix=match['arp_tpa'][:7]
-                if prefix == "169.254": 
-                    LOG.debug('PKT HND: ARP REQ HND: This is self assigned IP limited to LAN, not going to respond')
-                else:
-                    LOG.debug('PKT HND: ARP REQ HND: ARP request is a valid one, responding')
-                    _arp_send(dp=dp, port_out=match['in_port'], arp_code=2, eth_dst=match['eth_src'], eth_target=match['arp_sha'],
+            LOG.debug("ARP request accepted")
+            _arp_send(dp=dp, port_out=match['in_port'], arp_code=2, eth_dst=match['eth_src'], eth_target=match['arp_sha'],
                       ip_target=match['arp_spa'], ip_sender=match['arp_tpa'])
-                LOG.debug('PKT HND: ARP REQ HND: Reply to '+match['arp_spa'] +': Host '+match['arp_tpa']+' is at forwarder '+str(dp.id) )
+            LOG.debug('Reply to '+match['arp_spa'] +': Host '+match['arp_tpa']+' is at forwarder '+str(dp.id) )
             return
 
-        ##ARP response with target_ip==DISCOVERY_ARP_IP recieved - we found APN
-        if match['eth_type'] == 0x0806 and match['arp_op'] == 2 and match['arp_tpa'] == DISCOVERY_ARP_IP:
+        ##FIXED: All ARP responses are replied, regardless of the target IP
+        if match['eth_type'] == 0x0806 and match['arp_op'] == 2:
             LOG.debug('TOPO MNGR: ARP response with target APN discovery IP recieved at controller, processing for APN extraction')
             pkt = packet.Packet(array.array('B', ev.msg.data))
             arp_pkt=pkt.get_protocol(arp.arp)
@@ -710,12 +879,16 @@ class GPRSControll(app_manager.RyuApp):
             ##Search for apn in APN_POOL to add mac addr. and update topology
             for apn in APN_POOL:
                 if apn.ip_addr == apn_ip:
+                    LOG.debug('Recieved ARP response was from ' + apn.name + ' APN')
                     apn.eth_addr = apn_mac
                     topo.add_link(dp.id,str(apn.name),port)
                     topo.add_link(str(apn.name),dp.id,0)
                     topo.reload_topology()
                     LOG.debug('TOPO MNGR: APN '+str(apn.name)+' found at forwarder: '+str(dp.id)+', port: '+str(port) + ' by ARP search')
-                    
+                    key = str(dp.id)+"_"+str(port)
+                    #if key in FREE_INTERFACES: 
+                        #del FREE_INTERFACES[key]
+                    LOG.debug('MICHAL: FREE_INTERFACES:' + str(FREE_INTERFACES))
                     ##Add special rules to edge forwarder
                     self.on_edge_inet_dp_join(dp, port)  
                     ##Create MAC-tunnels between APN and all BSSs
@@ -761,6 +934,7 @@ class GPRSControll(app_manager.RyuApp):
             
 
         if ev.enter is True:
+            # in plain MAC setup, this should install only ICMP and ARP re-route rules, watchout for hardcoded DP id
             self.on_inner_dp_join(dp)
 	    ##For evry new forwarder we send out discovery ICMP packets out of every port except OFPP_CONTROLLER
             LOG.debug('TOPO MNGR: Forwarder: ' + str(dp.id) + ' saying hello to Unifycore Controller, Unifycore warmly welcomes you!')
@@ -770,14 +944,27 @@ class GPRSControll(app_manager.RyuApp):
                     _icmp_send(dp,port,DISCOVERY_IP_SRC, DISCOVERY_IP_DST)
                     for apn in APN_POOL:
                         if apn.ip_addr != None:
-                            LOG.debug('TOPO MNGR: Forwarder: '+str(dp.id)+', port: '+ str(port)   + ' is looking for APN: ' + str(apn.name) +' at IP: '+str(apn.ip_addr)+' with ARP search')
-                            _arp_send(dp=dp, port_out=port, arp_code=1, ip_target=apn.ip_addr, ip_sender=DISCOVERY_ARP_IP)
+                            ## FIXED: We have to generate ARPs from the APNs subnet, for now,
+                            ##        an incremented Ip will be used, however the ARP originator
+                            ##        IP address should be in configuration file per APN
+                            ## TODO:  Add ARP originator IP into configuration
+
+                            # We convert string IP into unsigned int
+                            integerIp = struct.unpack('!I',socket.inet_aton(apn.ip_addr))[0]
+                            # decrementt it
+                            integerIp -= 1
+                            # and put it back to string format                      
+                            ArpOriginStringIp = socket.inet_ntoa(struct.pack("!I",integerIp))
+                            LOG.debug('TOPO MNGR: Forwarder: '+str(dp.id)+', port: '+ str(port)   + ' is looking for APN: ' + str(apn.name) +' at IP: '+str(apn.ip_addr)+' with ARP search source IP: ' + ArpOriginStringIp)
+                            _arp_send(dp=dp, port_out=port, arp_code=1, ip_target=apn.ip_addr, ip_sender=ArpOriginStringIp)
+
 
         if ev.enter is False:
 	    ##TODO: We need to scan if any tunnels were affected, and if so, if any PDP COntexts were affected
             ##JUST REMOVING NODE FROM TOPOLOGY ISNT ENOUGH!
             LOG.debug('TOPO MNGR: Forwarder: ' + str(dp.id) + ' is leaving topology. It was a pleasure for us!')
             topo.del_forwarder(dp.id)
+
 
 
     def retry_tunnels(self):
@@ -804,7 +991,7 @@ class GPRSControll(app_manager.RyuApp):
             parser = dp.ofproto_parser
             match = parser.OFPMatch(eth_dst=inact_tunnel.tid_out)
             actions = [parser.OFPActionOutput(self.path_out[0].port_out)]
-            self.add_flow(dp, 300, match, actions, MAC_TUNNEL_TABLE)
+            self.add_flow(dp, 300, match, actions, TUNNEL_RULES, 0, MAC_TUNNEL_TABLE)
 
             ##Rules for all 'dumb' forwardes on the way OUT
             for node in self.path_out[1:-1]:
@@ -812,14 +999,14 @@ class GPRSControll(app_manager.RyuApp):
                 parser = dp.ofproto_parser
                 match = parser.OFPMatch(eth_dst=inact_tunnel.tid_out)
                 actions = [parser.OFPActionOutput(node.port_out)]
-                self.add_flow(dp, 300, match, actions, 0)
+                self.add_flow(dp, 300, match, actions, TUNNEL_RULES, 0, 0)
 
             ##Last forwarder on the way OUT needs to set eth_dst to eth_addr of APN otherwise it wont be processed
             dp = dpset.get(self.path_out[-1].dpid)
             parser = dp.ofproto_parser
             match = parser.OFPMatch(eth_dst=inact_tunnel.tid_out)
             actions = [ parser.OFPActionSetField(eth_dst=inact_tunnel.apn.eth_addr), parser.OFPActionOutput(self.path_out[-1].port_out)]
-            self.add_flow(dp, 300, match, actions, 0)
+            self.add_flow(dp, 300, match, actions, TUNNEL_RULES, 0, 0)
 
             ##Here comes tunnel for the way IN
             ##On first forwarder on the way IN these rules are placed into table MAC_TUNNEL_TABLE while on 'dumb' forwarders it goes to 0
@@ -827,7 +1014,7 @@ class GPRSControll(app_manager.RyuApp):
             parser = dp.ofproto_parser
             match = parser.OFPMatch(eth_dst=inact_tunnel.tid_in)
             actions = [parser.OFPActionOutput(self.path_in[0].port_out)]
-            self.add_flow(dp, 300, match, actions, MAC_TUNNEL_TABLE)
+            self.add_flow(dp, 300, match, actions, TUNNEL_RULES, 0, MAC_TUNNEL_TABLE)
 
             ##Rules for all 'dumb' forwardes on the way IN
             for node in self.path_in[1:-1]:
@@ -835,7 +1022,7 @@ class GPRSControll(app_manager.RyuApp):
                 parser = dp.ofproto_parser
                 match = parser.OFPMatch(eth_dst=inact_tunnel.tid_in)
                 actions = [parser.OFPActionOutput(node.port_out)]
-                self.add_flow(dp, 300, match, actions, 0)
+                self.add_flow(dp, 300, match, actions, TUNNEL_RULES, 0, 0)
 
             ##Last forwarder on the way IN sends packet to table OF_GPRS_TABLE_IN where it's matched based on active PDP CNTs
             dp = dpset.get(self.path_in[-1].dpid)
@@ -843,7 +1030,7 @@ class GPRSControll(app_manager.RyuApp):
             match = parser.OFPMatch(eth_dst=inact_tunnel.tid_in)
             inst = [ parser.OFPInstructionGotoTable(OF_GPRS_TABLE_IN) ]
             req = parser.OFPFlowMod(datapath=dp, priority=500, match=match, instructions=inst, table_id=0)
-            dp.send_msg(req)
+            self.update_flows(dp, req, 0, 500, match, inst, TUNNEL_RULES, 0)
 
             ACTIVE_TUNNELS.append(tunnel(inact_tunnel.bss, inact_tunnel.apn, self.tid_out, self.tid_in, self.path_out, self.path_in))
             LOG.debug('TOPO MNGR: Inactive tunnel between ' + str(inact_tunnel.bss) + ' and ' + str(inact_tunnel.apn.name) +' put into active state!')
@@ -884,7 +1071,7 @@ class GPRSControll(app_manager.RyuApp):
         parser = dp.ofproto_parser
         match = parser.OFPMatch(eth_dst=self.tid_out)
         actions = [parser.OFPActionOutput(self.path_out[0].port_out)]
-        self.add_flow(dp, 300, match, actions, MAC_TUNNEL_TABLE)
+        self.add_flow(dp, 300, match, actions, TUNNEL_RULES, 0, MAC_TUNNEL_TABLE)
 
         ##Rules for all 'dumb' forwardes on the way OUT
         for node in self.path_out[1:-1]:
@@ -892,14 +1079,14 @@ class GPRSControll(app_manager.RyuApp):
             parser = dp.ofproto_parser
             match = parser.OFPMatch(eth_dst=self.tid_out)
             actions = [parser.OFPActionOutput(node.port_out)]
-            self.add_flow(dp, 300, match, actions, 0)
+            self.add_flow(dp, 300, match, actions, TUNNEL_RULES, 0, 0)
 
         ##Last forwarder on the way OUT needs to set eth_dst to eth_addr of APN otherwise it wont be processed
         dp = dpset.get(self.path_out[-1].dpid)
         parser = dp.ofproto_parser
         match = parser.OFPMatch(eth_dst=self.tid_out)
         actions = [ parser.OFPActionSetField(eth_dst=self.apn.eth_addr), parser.OFPActionOutput(self.path_out[-1].port_out)]
-        self.add_flow(dp, 300, match, actions, 0)
+        self.add_flow(dp, 300, match, actions, TUNNEL_RULES, 0, 0)
 
         ##Here comes tunnel for way IN
         ##On first forwarder on the way IN these rules are placed into table MAC_TUNNEL_TABLE while on 'dumb' forwarders it goes to 0
@@ -907,7 +1094,7 @@ class GPRSControll(app_manager.RyuApp):
         parser = dp.ofproto_parser
         match = parser.OFPMatch(eth_dst=self.tid_in)
         actions = [parser.OFPActionOutput(self.path_in[0].port_out)]
-        self.add_flow(dp, 300, match, actions, MAC_TUNNEL_TABLE)
+        self.add_flow(dp, 300, match, actions, TUNNEL_RULES, 0, MAC_TUNNEL_TABLE)
 
         ##Rules for 'dumb' forwarders
         for node in self.path_in[1:-1]:
@@ -915,27 +1102,76 @@ class GPRSControll(app_manager.RyuApp):
             parser = dp.ofproto_parser
             match = parser.OFPMatch(eth_dst=self.tid_in)
             actions = [parser.OFPActionOutput(node.port_out)]
-            self.add_flow(dp, 300, match, actions, 0)
+            self.add_flow(dp, 300, match, actions, TUNNEL_RULES, 0, 0)
 
         ##Last forwarder on the way IN sends packet to table #4 where it's matched based on active PDP CNTs
         dp = dpset.get(self.path_in[-1].dpid)
-        parser = dp.ofproto_parser
+        dp.ofproto_parser
         match = parser.OFPMatch(eth_dst=self.tid_in)
         inst = [ parser.OFPInstructionGotoTable(OF_GPRS_TABLE_IN) ]
         req = parser.OFPFlowMod(datapath=dp, priority=500, match=match, instructions=inst, table_id=0)
-        dp.send_msg(req)
+        self.update_flows(dp, req, 0, 500, match, inst, TUNNEL_RULES, 0)       
 
         ACTIVE_TUNNELS.append(tunnel(self.bss,self.apn, self.tid_out, self.tid_in, self.path_out, self.path_in))
         LOG.debug('Tunnel between '+str(self.bss)+' and '+str(self.apn.name) + ' was set up.')
+
+
+    def update_flows(self, dp, mod, table_id, priority, match, inst, flow_type, cookie):
+        if any(fwd.id == dp.id for fwd in FORWARDERS):
+            for fwd in FORWARDERS:
+                if fwd.id == dp.id:
+                    fwd.add_flow(table_id, priority, match, inst, flow_type, cookie)            
+        else:
+            LOG.debug('MICHAL: Appending new forwarder')
+            FORWARDERS.append(forwarder(dp))
+            for fwd in FORWARDERS:
+                if fwd.id == dp.id:
+                    fwd.add_flow(table_id, priority, match, inst, flow_type, cookie)    
+        dp.send_msg(mod)
+                   
        
 
-    def add_flow(self, dp, priority, match, actions, table=0):
+    def add_flow(self, dp, priority, match, actions, flow_type, cookie, table=0):
         ofp = dp.ofproto
         parser = dp.ofproto_parser
-
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=dp, table_id=table, priority=priority, match=match, instructions=inst)
-        dp.send_msg(mod)
+        PREPINACE.append(prepinac(priority, match, inst, dp))
+        self.update_flows(dp, mod, table, priority, match, inst, flow_type, cookie)
+        
+    
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def port_stats_reply_handler(self, ev):
+        PORTS_STATS = []
+        #LOG.debug('MICHAL PORTSTATS ID' + str(ev.msg.datapath.id))
+        #LOG.debug('MICHAL: stats msg.body = ' + str(ev.msg))
+        for stat in ev.msg.body:
+            stats = Stats(stat.port_no,
+                      stat.rx_packets, stat.tx_packets,
+                      stat.rx_bytes, stat.tx_bytes,
+                      stat.rx_dropped, stat.tx_dropped,
+                      stat.rx_errors, stat.tx_errors,
+                      stat.rx_frame_err, stat.rx_over_err,
+                      stat.rx_crc_err, stat.collisions,
+                      stat.duration_sec, stat.duration_nsec) 
+            PORTS_STATS.append(stats)
+        FWD_PSTATS[ev.msg.datapath.id] = PORTS_STATS
+        #LOG.debug('MICHAL POrtStats: %s', FWD_PSTATS)
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def flow_stats_reply_handler(self, ev):
+        flows = []
+        #LOG.debug("MICHAL flow stats" + str(ev.msg.body))
+        for stat in ev.msg.body:
+            stats = flowStats(stat.table_id, stat.duration_sec, stat.duration_nsec, stat.priority, stat.idle_timeout,
+                              stat.hard_timeout, stat.flags, stat.cookie, stat.packet_count, stat.byte_count,
+                              stat.match, stat.instructions)
+            flows.append(stats)
+        FWD_FSTATS[ev.msg.datapath.id]=flows
+        
+        LOG.debug('MICHAL Flow stats %s', str(FWD_FSTATS))    
+
+ 
 
 
 class RestCall(ControllerBase):
@@ -1015,9 +1251,283 @@ class RestCall(ControllerBase):
         LOG.debug('STATUS DUMP: Dumping Topology state at /test/info URL!')
         return (response)
 
+    def add_apn(self, req, opt):
+        arguments = opt.split(',')
+		
+        forwarder = arguments[0].split('=')
+        dp = self.dpset.get(int(forwarder[1]))
+        fwd_h = hex(int(forwarder[1]))
+        fwd_id = fwd_h.split('x')
+        LOG.debug("MICHAL: KONVERTOVANE ID FORWARDERA " + fwd_id[1])
+        port = arguments[1].split('=')
+        port_num = int(port[1])
+		
+        apn_name = arguments[2].split('=')
+        new_apn = apn(apn_name[1])
+        ip_addr = 	arguments[3].split('=')	
+        apn_ip= ip_addr[1]
+        mask_arr = arguments[4].split('=')
+        mask = mask_arr[1]
+        LOG.debug("MICHAL pi=" + ip_addr[1])
+        #pridaj ip do /etc/hosts
+        key = forwarder[1]+"_"+port[1]
+        #if key in FREE_INTERFACES:
+           #interf = FREE_INTERFACES[key]
+           
+        cmd = ("grep core'" + fwd_id[1] + port[1] +"' /root/unifycore/support/network_init.sh | head -n 1 | cut -f4 -d ' '")
+        interface_name_ = subprocess.check_output(cmd, shell=True)
+           #cmd = ("echo -n '" + interface_name_ +"'")
+           #interface_name = subprocess.check_output(cmd, shell=True)
+        interface_name = interface_name_[:-1]
+        LOG.debug("MICHAL: interface_name=" + interface_name)
+        #LOG.debug("MICHAL: ADD APN " + interf + " " +apn_ip)
+        cmd = str("echo "+ apn_ip+" "+apn_name[1] + " >>/etc/hosts")
+        LOG.debug("MICHAL: ADD APN " +cmd)
+        os.system(cmd)
+        cmd = "ifconfig "+interface_name + " " + apn_ip + "/" + mask
+        LOG.debug("MICHAL: ADD ADD APN " +cmd)
+        os.system(cmd)
+        cmd = 'ifconfig '+interface_name + ' up'
+        LOG.debug("MICHAL: ADD APN " +cmd)
+        os.system(cmd)
+         #del FREE_INTERFACES[forwarder[1]+"_"+port[1]]
+
+           #FREE_INTERFACES = {"14_3":"apn1", "13_4":"apn2"}	
+        APN_POOL.append(new_apn)
+        
+           ##Resolving APN IP
+        if new_apn.ip_addr==None:
+            try:
+                ip_addr = str(socket.gethostbyname(new_apn.name))
+                new_apn.ip_addr = ip_addr
+                LOG.debug('Resolved APN '+new_apn.name+' : '+new_apn.ip_addr)
+            except socket.gaierror:
+                LOG.warning('Error while resolving apn name "'+new_apn.name+'"' )
+        
+        if new_apn.ip_addr != None:
+            ## FIXED: We have to generate ARPs from the APNs subnet, for now,
+            ##        an incremented Ip will be used, however the ARP originator
+            ##        IP address should be in configuration file per APN
+            ## TODO:  Add ARP originator IP into configuration
+
+            # We convert string IP into unsigned int
+            integerIp = struct.unpack('!I',socket.inet_aton(new_apn.ip_addr))[0]
+            # increment it
+            integerIp -= 1
+            # and put it back to string format                      
+            ArpOriginStringIp = socket.inet_ntoa(struct.pack("!I",integerIp))
+            LOG.debug('TOPO MNGR: Forwarder: '+str(dp.id)+', port: '+ str(port_num)   + ' is looking for APN: ' + str(new_apn.name) +' at IP: '+str(new_apn.ip_addr)+' with ARP search source IP: ' + ArpOriginStringIp)
+            _arp_send(dp=dp, port_out=port_num, arp_code=1, ip_target=new_apn.ip_addr, ip_sender=ArpOriginStringIp)
+    
+        return (Response(body="APN "+new_apn.name+" successfully connected to forwarder "+forwarder[1]+" on port " + str(port_num), headerlist=[('Access-Control-Allow-Origin', '*')]))
+     #else:
+		#return (Response(body="APN "+new_apn.name+" Port is already in use ", headerlist=[('Access-Control-Allow-Origin', '*')]))
+
+    def send_icmp_packet(self, req, opt):
+		arguments = opt.split(',')
+		forwarder = arguments[0].split('=')
+		dp = self.dpset.get(int(forwarder[1]))
+		port = arguments[1].split('=')
+		port_num = int(port[1]) 
+		for i in range(0,100):
+        		_icmp_send(dp, port_num)
+ 		return (Response(body="100 ICMP packets sent on port:" +port[1] + "of forwarder " + forwarder[1] , headerlist=[('Access-Control-Allow-Origin', '*')]))
+			
+
+
+    def dump_statistics(self, req):       
+        for fwd in FORWARDERS:             
+            dp = self.dpset.get(int(fwd.id))
+            self.send_port_stats_request(dp)
+        return (Response(content_type='application/json', body=json.dumps(FWD_PSTATS, default=lambda o: o.__dict__, indent = 1), headerlist=[('Access-Control-Allow-Origin', '*')]))
+
+
+
+    def send_port_stats_request(self, datapath):
+        ofp = datapath.ofproto
+        ofp_parser = datapath.ofproto_parser
+        req = ofp_parser.OFPPortStatsRequest(datapath, 0, ofp.OFPP_ANY)
+        datapath.send_msg(req)
+
+
+    def dump_flow_statistics(self, req):
+		 for fwd in FORWARDERS:
+		     dp = self.dpset.get(int(fwd.id))
+		     self.send_flow_stats_request(dp)
+		# stats_json = json.dumps(FWD_FSTATS, default=lambda o: o.__dict__, indent = 1).encode('ISO-8859-1').strip()
+		 #LOG.debug('MICHAL JSON:')
+		 #OG.debug(stats_json)
+		 return (Response(content_type='application/json', body=json.dumps(FWD_FSTATS, default=lambda o: o.__dict__, indent = 1), headerlist=[('Access-Control-Allow-Origin', '*')]))
+
+    def send_flow_stats_request(self, datapath):
+        ofp = datapath.ofproto
+        ofp_parser = datapath.ofproto_parser
+
+        cookie = cookie_mask = 0
+        match = ofp_parser.OFPMatch()
+        req = ofp_parser.OFPFlowStatsRequest(datapath, 0,
+                                         ofp.OFPTT_ALL,
+                                         ofp.OFPP_ANY, ofp.OFPG_ANY,
+                                         cookie, cookie_mask,
+                                         match)
+        datapath.send_msg(req)
+
+
+    def delete_flow (self, req, opt):
+        LOG.debug('MICHAL: Deleting flow with REST CALL')
+        LOG.debug('MICHAL: url opt: ' + str(opt)) 
+        flow = json.loads(opt)
+        #LOG.debug('MICHAL: url data id: ' + str(flow['id']))
+        #LOG.debug('MICHAL: url data inst: ' + str(flow['instruction']))
+           
+        
+        for fwd in FORWARDERS:
+	        dp = self.dpset.get(int(fwd.id))
+	        if fwd.id == flow['id']:
+				for tab in fwd.tables:
+					if tab.id == flow['table']:
+						for f in tab.flows:
+							counter = 0 
+							i = 0
+							if f.priority == int(flow['priority']):
+								if len(f.match._fields2) == len(flow['fields2']):
+									#LOG.debug('MICHAL: rovnake dlzky fieldov2')
+									for m in f.match._fields2:
+										#LOG.debug('MICHAL: url data fields[i]: ' + str(flow['fields2'][i]))
+										url_mtch = str(flow['fields2'][i][0]) + "="+str(flow['fields2'][i][1])
+										fwd_mtch=str(m[0]) + "=" +str(m[1])
+										#LOG.debug('MICHAL: url_mtch fields: ' + url_mtch)
+										#LOG.debug('MICHAL: fwd_mtch fields2: ' + fwd_mtch)
+										i = i+1
+										if url_mtch == fwd_mtch:
+											counter = counter + 1
+								if counter ==  len(f.match._fields2):
+									LOG.debug('MICHAL: delete_flow() - Found matching flow')
+									self.remove_table_flows(dp, flow['table'],f.match, f.inst)
+									tab.flows.remove(f)
+									if len(tab.flows) == 0:
+										fwd.tables.remove(tab)
+									break
+		#LOG.debug('MICHAL: No matching flow found')
+        return (Response(content_type='application/json', body="DELETING FLOW", headerlist=[('Access-Control-Allow-Origin', '*')]))
+
+
+    def remove_table_flows(self, datapath, table_id, match, instructions):
+        #Create OFP flow mod message to remove flows from table.
+        ofproto = datapath.ofproto
+        flow_mod = datapath.ofproto_parser.OFPFlowMod(datapath=datapath, table_id=table_id, command=ofproto.OFPFC_DELETE, 
+                                                out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY, match=match, instructions=instructions)
+        datapath.send_msg(flow_mod)
+
     def dump_topology (self, req):
-        LOG.debug('REST: TOPO DUMP: Dumping topology to JSON at /topology/dump ')
+        LOG.debug('TOPO DUMP: Dumping topology to JSON at /topology/dump ')
         return (Response(content_type='application/json', body=topo.dump(), headerlist=[('Access-Control-Allow-Origin', '*')]))
+
+    def dump_oftables (self, req, opt):
+        LOG.debug('MICHAL: Dumping OF tables to JSON at /oftables/dump/')
+        #index = next(index for index,fwd in enumerate(FORWARDERS) if fwd.id == opt)
+        for fwd in FORWARDERS:
+            if fwd.id == int(opt):
+                fwdIndex = FORWARDERS.index(fwd)
+                return (Response(content_type='application/json', body=json.dumps(FORWARDERS[fwdIndex], default=lambda o: o.__dict__, indent = 1, sort_keys = True),  headerlist=[('Access-Control-Allow-Origin', '*')]))
+
+    def dump_active_pdps(self, req):
+        LOG.debug('MICHAL: Dumping ACTIVE_CONTEXTS to JSON at /gprs/pdp_dump')
+        cont.context_array = ACTIVE_CONTEXTS
+        return (Response(content_type='application/json', body=json.dumps(cont, default=lambda o: o.__dict__, indent = 1, sort_keys = True),
+        headerlist=[('Access-Control-Allow-Origin', '*')]))
+
+    def dump_active_tunnels(self, req):
+        LOG.debug('MICHAL: Dumping ACTIVE_TUNNELS to JSON at /tunnels/active/dump')
+        return (Response(content_type='application/json', body=json.dumps(ACTIVE_TUNNELS, default=lambda o: o.__dict__, indent = 1, sort_keys = True),
+        headerlist=[('Access-Control-Allow-Origin', '*')]))
+
+
+    def user_added_flow(self, req, opt):
+        LOG.debug('MICHAL: Adding flow: ' + opt)
+        flow = json.loads(opt)
+        LOG.debug('MICHAL: ID of flow = ' + str(flow['id']))
+
+        dp = self.dpset.get(flow['id'])
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        match_string = ""
+        counter = 0
+        for mtch in flow['matches']:
+            match_string += str(mtch)
+            counter+=1
+            if counter < len(flow['matches']):
+                match_string +=", "
+        LOG.debug('MICHAL: match_string: ' + match_string)
+        exec("match = parser.OFPMatch( "+match_string+")") 
+        LOG.debug('MICHAL: match=' + str(match))
+        
+        
+        all_actions = "" 
+        for act in flow['actions']:
+            if act['a_type']=="PushGPRSNS" or act['a_type']=="PopGPRSNS" or act['a_type']=="PushUDPIP" or act['a_type']=="PopUDPIP": 
+			    name="GPRSAction" + act['a_type'] + "("
+				#GPRSActionPushGPRSNS(bvci, tlli, sapi, nsapi, drx_param, imsi),
+                # GPRSActionPushUDPIP(sa=VGSN_IP, da=BSS_IP, sp=VGSN_PORT, dp=BSS_PORT),
+            else:
+			    name = "parser."+act['a_type']+"("
+            attributes = ""
+            for prop in act['properties']:
+				attributes = attributes + prop + ", "
+            attributes = attributes[:-2]
+            all_actions = all_actions + name + attributes + "), "
+       
+        all_actions = all_actions[:-2] 
+        LOG.debug('MICHAL: adding actions:    action = [' + all_actions +"]")
+        exec("actions = ["+ all_actions +"]")
+		
+        all_inst = ""
+        for ins in flow['inst']:
+			name =ins['i_type']
+			if name=="OFPInstructionGotoTable" or name=="OFPInstructionWriteMetadata" or name=="OFPInstructionMeter":
+				name = "parser."+ins['i_type']+"("
+				attr = ""
+				for prop in ins['properties']:
+					attr = attr + prop + ", "
+				attr = attr[:-2]
+				all_inst = all_inst + name + attr + "), "
+			else:
+				name = "parser.OFPInstructionActions("
+				attr = "ofp." + ins['i_type'] + ", actions"
+				all_inst = all_inst + name + attr + "), "
+			
+        all_inst = all_inst[:-2]
+        exec("inst = ["+ all_inst +"]")
+        LOG.debug('MICHAL: adding instructions:    instructions = [' + all_inst +"]")
+	
+        if flow['cookie'] == "":
+			self.add_flow(dp, 0, flow['table_id'], flow['priority'], match, actions, USER_DEFINED, inst)
+        else:
+			self.add_flow(dp, int(flow['cookie']), flow['table_id'], flow['priority'], match, actions, USER_DEFINED, inst)
+        return (Response(body="Flow successfuly added.", headerlist=[('Access-Control-Allow-Origin', '*')]))
+       
+            
+        
+    def update_flows(self, dp, req, table_id, priority, match, inst, flow_type, cookie):
+        if any(fwd.id == dp.id for fwd in FORWARDERS):
+            for fwd in FORWARDERS:
+                if fwd.id == dp.id:
+                    fwd.add_flow(table_id, priority, match, inst, flow_type, cookie)
+        else:
+            FORWARDERS.append(forwarder(dp))
+            for fwd in FORWARDERS:
+                if fwd.id == dp.id:
+                    fwd.add_flow(table_id, priority, match, inst, flow_type, cookie)
+        
+        
+        
+    def add_flow(self, dp, cookie, table, priority, match, actions, flow_type, inst):
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        mod = parser.OFPFlowMod(datapath=dp, cookie=cookie, priority=int(priority), table_id=int(table), match=match, instructions=inst)
+        dp.send_msg(mod)
+        self.update_flows(dp, mod, int(table), int(priority), match, inst, flow_type, cookie)
+
 
     def mod_pdp (self, req, cmd):
         LOG.debug('REST: mod_pdp: Modification of PDP called')
@@ -1068,6 +1578,7 @@ class RestCall(ControllerBase):
         #TODO: Handling of 'cmd' value
         ACTIVE_CONTEXTS.append( PDPContext(bvci, tlli, sapi, nsapi, tid_out, tid_in, client_ip, imsi, drx_param) )
         
+        
         ###WAY OUT
         ##First node on the way OUT removes GPRS headers, sets eth addr. to appropriate tunnel ID
         ##and sends packet to table MAC_TUNNEL_TABLE
@@ -1086,8 +1597,8 @@ class RestCall(ControllerBase):
                    parser.OFPActionSetField(eth_src=tid_in),parser.OFPActionSetField(eth_dst=tid_out)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions), parser.OFPInstructionGotoTable(MAC_TUNNEL_TABLE)]                   
         req = parser.OFPFlowMod(datapath=dp, priority=100, match=match, instructions=inst, table_id = OF_GPRS_TABLE)
-        dp.send_msg(req)
-
+        #dp.send_msg(req)
+        self.update_flows(dp, req, OF_GPRS_TABLE, 100, match, inst, PDP_FLOWS, 0)
 
         ###WAY IN
         ##On the way IN we need to match packet on both first and last forwarder
@@ -1102,8 +1613,10 @@ class RestCall(ControllerBase):
         actions = [ parser.OFPActionSetField(eth_dst=tid_in), parser.OFPActionSetField(eth_src=tid_out) ]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions), parser.OFPInstructionGotoTable(MAC_TUNNEL_TABLE)]
         req = parser.OFPFlowMod(datapath=dp, priority=300, match=match, instructions=inst, table_id = 0)
-        dp.send_msg(req)
+        #dp.send_msg(req)
+        self.update_flows(dp, req, 0, 300, match, inst, PDP_FLOWS, 0)
      
+        #LOG.debug('MICHAL: dp = self.dpset.get(path_in[-1].dpid)=' + str(path_in[-1].dpid))
         dp = self.dpset.get(path_in[-1].dpid)
         parser = dp.ofproto_parser
         ofp = dp.ofproto
@@ -1119,17 +1632,14 @@ class RestCall(ControllerBase):
         inst=[ parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions) ]
  
         req = parser.OFPFlowMod(datapath=dp, priority=100, match=match, instructions=inst, table_id = OF_GPRS_TABLE_IN)
-        dp.send_msg(req)
+        #dp.send_msg(req)
+        self.update_flows(dp, req, OF_GPRS_TABLE_IN, 100, match, inst, PDP_FLOWS, 0)
 
-        return (Response(content_type='application/json', body='{"address":"'+client_ip+'","dns1":"8.8.8.8","dns2":"8.8.8.8"}'))
 
-    def add_flow(self, dp, priority, match, actions, table = 0):
-        ofp = dp.ofproto
-        parser = dp.ofproto_parser
+        return (Response(content_type='application/json', body='{"address":"'+client_ip+'","dns1":"8.8.8.8","dns2":"8.8.8.8"}', headerlist=[('Access-Control-Allow-Origin', '*')]))
 
-        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(datapath=dp, priority=priority, table_id=table, match=match, instructions=inst)
-        dp.send_msg(mod)
+
+
 
 class GPRSAction(ofproto_v1_3_parser.OFPActionExperimenter):
     subtype = 0
